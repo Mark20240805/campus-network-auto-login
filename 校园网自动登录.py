@@ -47,6 +47,11 @@
 
 依赖：pystray、Pillow、cryptography（pip install pystray pillow cryptography）
 配置保存在同目录 config.json，日志写入同目录 login.log。
+
+许可：GNU GPL-3.0-or-later（全文见 LICENSE 文件）。
+Copyright (C) 2026 Mark20240805
+本程序可自由使用、修改与再分发；再分发（含打包后的 exe）时必须以同一许可
+提供源码。本程序不附带任何担保，详见 GPL-3.0 第 15、16 条。
 """
 
 import json

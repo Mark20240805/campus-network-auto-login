@@ -17,6 +17,8 @@
 
 注意：castest / login 需要把密码当作命令行参数传入，会留在 shell 历史里。
      日常排错请用 relogin（读 config.json 里的 DPAPI 密文），别把密码写进脚本或历史。
+
+许可：GPL-3.0-or-later（全文见 LICENSE 文件）。Copyright (C) 2026 Mark20240805。
 """
 
 import importlib.util
