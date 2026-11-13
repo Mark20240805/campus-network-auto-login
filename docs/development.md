@@ -22,7 +22,7 @@ python -m pytest -q
 
 ## 版本与发布
 
-当前版本：**1.0.3**，变更见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**1.0.3**，变更见 [CHANGELOG.md](../CHANGELOG.md)。
 
 发版时要一起改这四处，否则界面标题、exe 属性和安装包版本会对不上：
 
