@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 只读权限：本流程不需要写仓库（不自动发布、不提 PR）
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    # 主程序依赖 Windows API（DPAPI / winreg），在 Windows runner 上跑最接近真实环境
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # 测试只覆盖纯逻辑，主程序对 pystray/PIL/cryptography 都是惰性导入，
+      # 所以只装 pytest 就够，不必装运行期依赖（省 1~2 分钟）
+      - name: 安装测试依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: 跑单元测试
+        run: python -m pytest -q
+
+      - name: 确认仓库里没有个人数据
+        shell: bash
+        run: |
+          if git ls-files | grep -Ei '(^|/)(config\.json|login\.log.*|diag[^/]*\.(txt|json)|diag_raw/)'; then
+            echo "::error::检测到个人数据被纳入版本管理，请 git rm --cached 后重试"
+            exit 1
+          fi

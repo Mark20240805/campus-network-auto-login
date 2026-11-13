@@ -1,0 +1,62 @@
+# ---------------- 个人数据：绝对不能提交 ----------------
+# 运行期生成，含学号/密码密文/真实 IP 与 MAC
+config.json
+login.log
+login.log*
+diag.txt
+diag_raw/
+*.log
+*.env
+.env
+
+# 证书私钥（公钥证书 .cer 可以留，私钥一律不留）
+*.pfx
+*.p12
+*.pvk
+*.key
+*.pem
+*.jks
+*.keystore
+
+# ---------------- AI / 编辑器工作区 ----------------
+.workbuddy/
+.claude/
+.cursor/
+.idea/
+.vscode/
+*.swp
+
+# ---------------- 项目内部产物（报告/临时文件） ----------------
+deliverables/
+.tmp_check/
+
+# ---------------- Python ----------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+*.spec
+
+# ---------------- 打包中间产物 / 大文件 ----------------
+# 需要 release 时另行上传到 GitHub Release，不进仓库
+stage/
+stage_nuitka/
+nuitka_out/
+dist/
+build/
+installer/output/
+_MEI*/
+*.dmp
+*scons-debug.py
+
+# ---------------- 系统垃圾 ----------------
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,10 @@
+# 运行依赖（Python 3.9+）
+# cryptography 3.4 存在已知 CVE（如 CVE-2023-0286 / CVE-2024-26130），
+# 统一要求 >=42.0；3.9 及更早的 Python 需自行降到 39.x 并接受风险。
+pystray>=0.19
+# 低于 10.3.0 受 CVE-2024-28219 影响（评估版见 GHSA-3f63-... 系列）
+Pillow>=10.3.0
+cryptography>=42.0
+
+# 实测通过的版本组合（排查环境问题时可参考，不必严格锁定）：
+#   Python 3.12.10 / pystray 0.19.5 / Pillow 10.4.0 / cryptography 46.0.4

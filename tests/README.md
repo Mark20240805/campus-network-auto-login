@@ -1,0 +1,32 @@
+# 测试说明
+
+本项目的最小回归测试集，覆盖上线前检查中反复强调、最容易回归的核心点。
+
+## 运行
+
+```bash
+# 需要 pytest（建议用系统自带 tkinter 的 Python 3.9+）
+pip install -r requirements-dev.txt
+py -3.12 -m pytest          # 或 python -m pytest
+```
+
+## 覆盖范围
+
+| 文件 | 覆盖内容 |
+|------|---------|
+| `test_core.py` | 退避算法、日志脱敏（幂等 + 白名单覆盖）、入口归一化、`_ip_literal`、重定向限域（B4）、Cookie 主机隔离（B4）、失败分类（B1） |
+| `test_config_log.py` | 配置保存（空值保留旧密文）、明文迁移、原子写、日志轮转（保留 3 份）、`scrub_log` 幂等收敛 |
+
+## 设计要点
+
+- **不碰真实数据**：测试全部使用**虚构**的学号 / MAC / IP（如 `2023000001`、
+  `a1b2c3d4e5f6`、`10.11.12.13`），与任何真实账号无关；`conftest.py` 的 `tmp_paths`
+  fixture 把 `CONFIG_FILE` / `LOG_FILE` 指向临时目录，DPAPI 加密被 monkeypatch 成确定值，
+  绝不读写你机器上的 `config.json` / `login.log`，也不发起任何真实登录请求。
+- **兼容无 Tk 环境**：`conftest.py` 只在 tkinter 缺失时才注入桩模块，让精简版
+  Python 也能 import 主模块跑纯函数测试。
+
+## 已知盲区（不在本测试集内）
+
+真实门户认证、网关拦截链路、多网卡选路、托盘 UI、开机自启、安装包升级——
+这些依赖真实校园网网关与桌面环境，无法在单测里验证，需真机回归。
