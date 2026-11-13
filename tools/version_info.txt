@@ -4,8 +4,8 @@
 # 避免"无元数据的打包程序"被启发式引擎当成可疑样本
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 2, 0),
-    prodvers=(1, 0, 2, 0),
+    filevers=(1, 0, 3, 0),
+    prodvers=(1, 0, 3, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -20,12 +20,12 @@ VSVersionInfo(
           '080404b0',
           [StringStruct('CompanyName', 'CampusNet AutoLogin'),
            StringStruct('FileDescription', '校园网自动认证系统'),
-           StringStruct('FileVersion', '1.0.2.0'),
+           StringStruct('FileVersion', '1.0.3.0'),
            StringStruct('InternalName', 'CampusNetAutoLogin'),
            StringStruct('LegalCopyright', 'Copyright (C) 2026'),
            StringStruct('OriginalFilename', '校园网自动认证系统.exe'),
            StringStruct('ProductName', '校园网自动认证系统'),
-           StringStruct('ProductVersion', '1.0.2.0')])
+           StringStruct('ProductVersion', '1.0.3.0')])
       ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]

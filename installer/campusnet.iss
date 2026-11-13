@@ -3,7 +3,7 @@
 ; 安装时会自动检测旧版本安装目录并覆盖升级，保留 config.json / login.log
 
 #define MyAppName "校园网自动认证系统"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppExeName "校园网自动认证系统.exe"
 #define MyAppPublisher "CampusNet AutoLogin"
 #ifndef MyPayloadDir

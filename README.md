@@ -9,6 +9,9 @@
 ## 功能特性
 
 - **图形界面配置**：认证地址、学号、密码、运营商均可自定义，保存为 `config.json`
+- **认证链接一键解析**：从浏览器复制到的那一整串 ePortal 认证链接（带
+  `wlanuserip` / `nasip` / `mac` / `sessionId` 等一次性参数）可以直接粘进认证地址框，
+  点「解析链接」（或直接粘贴）自动截成 `https://sam.ahpu.edu.cn`，随机参数自动丢弃
 - **密码加密存储**：密码用 Windows DPAPI 加密，密文仅在当前用户+当前电脑可解，配置文件可安全分发
 - **系统托盘常驻**：程序启动后驻留托盘，关闭窗口自动最小化到托盘，不退出
   - 图标颜色：🟢 绿 = 在线　⚪ 灰 = 离线　🔴 红 = 登录失败（悬停图标查看详细状态）
@@ -38,7 +41,7 @@
 | `config.json` | 配置文件（首次保存后生成，与程序同目录，**不要外发**） |
 | `login.log` | 运行日志（与程序同目录） |
 | `requirements.txt` | 运行依赖，`pip install -r requirements.txt` |
-| `tests\` | 单元测试（pytest，21 个用例，CI 也会跑） |
+| `tests\` | 单元测试（pytest，101 个用例，CI 也会跑） |
 | `requirements-dev.txt` | 测试依赖 |
 | `LICENSE` | 许可证（PolyForm Noncommercial 1.0.0） |
 | `CHANGELOG.md` | 版本变更记录 |
@@ -81,6 +84,9 @@ python 校园网自动登录.py --status
 
 1. 运行程序 → 配置窗口
 2. 认证地址保持默认 `https://sam.ahpu.edu.cn`
+   （若你是从浏览器地址栏复制的认证链接，带 `wlanuserip`/`nasip`/`sessionId` 等一长串
+   参数的那一整段可以直接粘到认证地址框，点右侧「解析链接」或直接粘贴，
+   即会自动截成 `https://sam.ahpu.edu.cn`）
 3. 填 **学号** 和 **统一身份认证密码**（与微校园、今日校园同一套密码）
 4. 选择运营商出口：未办理运营商套餐的选「校园网」；办了宽带的选对应运营商
 5. 按需勾选「开机自动登录」「显示登录通知」
@@ -115,6 +121,11 @@ python 校园网自动登录.py --status
 程序会照配置的出口去试，失败时明确提示"出口不在可选列表"，
 不会静默换成列表里的第一家运营商（避免无意中走计费出口）。
 
+> **认证地址只填「协议 + 主机 + 端口」**（如 `https://sam.ahpu.edu.cn`），
+> 不要带 `/eportal/index.jsp?wlanuserip=…` 这类路径和参数：后缀那些参数是每次会话
+> 随机下发的一次性值，带上就会拼出错误的认证地址。粘了整段也没关系——
+> 点「解析链接」或直接保存都会自动截成 origin。
+
 - 把程序目录发给别人，对方解不开你的学号和密码，日志会提示「…无法解密，请重新输入」
 - 换人使用：删掉 `config.json`，让对方重新填学号密码
 - 学号/密码两项任一解不开时，保存会保留原密文，只是切开关不会把它们冲掉
@@ -136,7 +147,7 @@ python 校园网自动登录.py --status
 ## 分发给同学
 
 1. 用下面的 **Nuitka + Inno Setup** 流程打安装包，把
-   `installer\output\校园网自动认证系统_安装包_1.0.2.exe` 发给同学
+   `installer\output\校园网自动认证系统_安装包_1.0.3.exe` 发给同学
 2. **不要附带 `config.json`**（里面是你的学号和你机器加密的密码）
 3. 同学双击安装包 → 一路下一步 → 启动后填自己的学号和密码 → 勾「开机自动登录」→ 保存并登录
 4. 自启项会自动指向 **程序当前所在路径**；程序目录被移动后，下次启动会自动校正注册表项
@@ -321,7 +332,7 @@ python -m pytest -q
 ```
 
 ```
-21 passed in 0.3s
+101 passed in 1.0s
 ```
 
 - `tests/conftest.py` 注入了 tkinter 的测试替身，所以 **无图形环境也能跑**（GitHub Actions 的 Windows runner 用的就是这套）
@@ -387,7 +398,7 @@ python -m nuitka --standalone --windows-console-mode=disable ^
   --include-package=pystray --include-package=PIL --include-package=cryptography ^
   --windows-icon-from-ico=tools\app.ico ^
   --company-name="CampusNet AutoLogin" --product-name="校园网自动认证系统" ^
-  --file-version=1.0.2.0 --product-version=1.0.2.0 ^
+  --file-version=1.0.3.0 --product-version=1.0.3.0 ^
   --output-dir=nuitka_out --output-filename=校园网自动认证系统.exe ^
   校园网自动登录.py
 ```
@@ -439,7 +450,7 @@ python -m nuitka --standalone --windows-console-mode=disable ^
   "/DMyPayloadDir=..\stage_nuitka\校园网自动认证系统" installer\campusnet.iss
 ```
 
-产物：`installer\output\校园网自动认证系统_安装包_1.0.2.exe`
+产物：`installer\output\校园网自动认证系统_安装包_1.0.3.exe`
 
 - 不传 `/DMyPayloadDir` 时默认用 `..\stage_nuitka\校园网自动认证系统`
 - `[Files]` 用的是通配，PyInstaller 的 `_internal` 结构和 Nuitka 的扁平结构都能打
@@ -504,7 +515,7 @@ Nuitka 编译 → 签 stage_nuitka\…\校园网自动认证系统.exe → ISCC 
 
 ```powershell
 Get-AuthenticodeSignature 'stage_nuitka\校园网自动认证系统\校园网自动认证系统.exe'
-Get-AuthenticodeSignature 'installer\output\校园网自动认证系统_安装包_1.0.2.exe'
+Get-AuthenticodeSignature 'installer\output\校园网自动认证系统_安装包_1.0.3.exe'
 ```
 
 ### 让同学的电脑也信任（自签名才需要）
@@ -560,7 +571,7 @@ powershell -ExecutionPolicy Bypass -File tools\sign.ps1 -Pfx D:\codesign.pfx -Pf
 同学拿到文件后可以这样绕开拦截（任选其一）：
 
 - 右键 exe → 属性 → 底部勾「**解除锁定**」→ 确定
-- 或用 PowerShell：`Unblock-File .\校园网自动认证系统_安装包_1.0.2.exe`
+- 或用 PowerShell：`Unblock-File .\校园网自动认证系统_安装包_1.0.3.exe`
 - SmartScreen 弹窗里点「更多信息」→「仍要运行」
 - 通过 U 盘/局域网拷贝（没有 Mark-of-the-Web）通常**根本不会弹**
 
@@ -603,7 +614,7 @@ SecureAge     Malicious
 
 ## 版本与发布
 
-当前版本：**1.0.2**，变更见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**1.0.3**，变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 发版时要一起改这四处，否则界面标题、exe 属性和安装包版本会对不上：
 
@@ -630,18 +641,18 @@ git status --short               # 应为空
 ```bash
 git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
-git push origin v1.0.2          # 推标签（Release 要用）
+git push origin v1.0.3          # 推标签（Release 要用）
 ```
 
 exe 和安装包**不进仓库**，作为 [Release](https://docs.github.com/repositories/releasing-projects-on-github)
-附件上传：在 GitHub 页面 `Releases → Draft a new release`，选 `v1.0.2` 标签，
-把 `installer\output\校园网自动认证系统_安装包_1.0.2.exe` 和
-`stage_nuitka\...\校园网自动认证系统.exe` 拖进附件区，正文直接复用 `CHANGELOG.md` 的 1.0.2 段落。
+附件上传：在 GitHub 页面 `Releases → Draft a new release`，选 `v1.0.3` 标签，
+把 `installer\output\校园网自动认证系统_安装包_1.0.3.exe` 和
+`stage_nuitka\...\校园网自动认证系统.exe` 拖进附件区，正文直接复用 `CHANGELOG.md` 的 1.0.3 段落。
 
 建议同时附上校验值，方便同学核对下载是否完整：
 
 ```bash
-certutil -hashfile "installer\output\校园网自动认证系统_安装包_1.0.2.exe" SHA256
+certutil -hashfile "installer\output\校园网自动认证系统_安装包_1.0.3.exe" SHA256
 ```
 
 万一以后误提交了 `config.json`，执行 `git rm --cached config.json` 再提交，
@@ -651,6 +662,10 @@ certutil -hashfile "installer\output\校园网自动认证系统_安装包_1.0.2
 
 
 - **托盘图标不显示**：未安装 pystray，执行 `pip install pystray pillow`
+- **认证地址怎么填**：只填「协议 + 主机 + 端口」，例如 `https://sam.ahpu.edu.cn`；
+  浏览器复制来的完整链接（带 `wlanuserip`/`nasip`/`sessionId` 一长串参数）整段粘进去，
+  点「解析链接」即可自动截成 origin，不要手工保留路径和参数。
+  手写的明显非法地址（`http://`、`ftp://…`、主机或端口不合法）在保存时会被拦下并提示原因
 - **提示缺少 cryptography**：执行 `pip install cryptography`（密码加密必需）
 - **开机没自动登录**：托盘菜单确认「开机自动登录」已勾选；任务管理器→启动 中查看启动项是否被禁用
 - **登录失败**：查看 `login.log`，对照上面的「常见报错对照」表

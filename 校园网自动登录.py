@@ -6,6 +6,8 @@
 
 功能：
   - 首次运行填写配置（认证地址/学号/密码/运营商），保存为 config.json
+  - 认证地址支持粘贴浏览器里复制到的完整 ePortal 链接：点「解析链接」或直接粘贴，
+    自动截成 origin（协议 + 主机 + 端口），丢弃 wlanuserip/sessionId 等一次性参数
   - 开机自启（注册表 Run 项，pythonw 静默运行）后自动读取配置登录
   - 常驻系统托盘：右键图标查看状态/立即登录/配置/自启/退出
   - 托盘图标颜色：绿=在线 灰=离线 红=登录失败（悬停显示详细状态）
@@ -57,10 +59,12 @@ import http.client
 import http.cookiejar
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 import base64
+import collections
 import ctypes
 import ctypes.wintypes
 from datetime import datetime
@@ -132,7 +136,7 @@ def cleanup_stale_mei():
         pass
 
 DEFAULT_PORTAL = "https://sam.ahpu.edu.cn"
-APP_VERSION = "1.0.2"      # 发版时和 installer\campusnet.iss、tools\version_info.txt 一起改
+APP_VERSION = "1.0.3"      # 发版时和 installer\campusnet.iss、tools\version_info.txt 一起改
 # 兜底列表：正常从 serviceSelection 接口实时拉取
 DEFAULT_SERVICES = ["校园网", "中国电信", "中国移动", "中国联通"]
 # 新建配置的默认出口：没办运营商套餐的同学走校园网。
@@ -290,10 +294,26 @@ def log(message):
 
 
 def normalize_portal(url):
-    url = (url or "").strip().rstrip("/")
-    if url and "://" not in url:
-        url = "https://" + url
-    return url
+    """把用户填写的认证地址归一成 origin（协议 + 主机 + 端口）
+
+    认证地址只该是 origin：后续所有请求都是 `portal + "/eportal/redirect.jsp"`
+    这样拼出来的。用户从浏览器复制来的却是整串带参数的完整链接，直接拼接会变成
+    `…/eportal/index.jsp?wlanuserip=…/eportal/redirect.jsp`，认证必然失败。
+
+    这里用 parse_portal_link 截掉路径与参数；解析不出来时退回"补 https:// + 去尾斜杠"
+    的老逻辑（保持宽松，不改变原有返回值语义，老配置照样能用）。
+    解析规则见下方「认证链接解析」一节（定义在后，运行时才调用）。
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    portal = parse_portal_link(raw).portal
+    if portal:
+        return portal
+    raw = raw.rstrip("/")
+    if raw and "://" not in raw:
+        raw = "https://" + raw
+    return raw
 
 
 def retry_delay(fail_streak):
@@ -306,6 +326,287 @@ def _ip_literal(host):
     """是不是 IPv4 字面量（网关 IP 不可能有合法证书，直接不校验）"""
     parts = (host or "").split(".")
     return len(parts) == 4 and all(p.isdigit() for p in parts)
+
+
+# ---------------------------------------------------------------- 认证链接解析
+#
+# 用户从浏览器复制到的是「完整认证链接」，形如
+#   https://sam.ahpu.edu.cn/eportal/index.jsp?wlanuserip=…&nasip=…&mac=…&t=wireless-v2
+# 后缀那些参数是 NAS 每次会话随机下发的一次性参数，无法复用；直接当认证地址用会拼出
+#   …/eportal/index.jsp?…&t=wireless-v2/eportal/redirect.jsp
+# 于是必然失败，而且报错信息看不出原因。这里把它截成 origin（协议 + 主机 + 端口）。
+#
+# 约束：
+#   - 全是纯函数，不发任何网络请求（用户粘链接时往往还没连上校园网）；
+#   - 不在日志/弹窗里回吐链接原文（含 sessionId / mac / wlanuserip / userIp），
+#     只输出 origin 和"丢弃了几个参数"这类计数。
+
+ParseResult = collections.namedtuple("ParseResult", "portal error warning detail")
+
+ERR_PORTAL_EMPTY = "请先粘贴完整的网络认证链接（浏览器地址栏里 eportal 那一串）。"
+ERR_PORTAL_NO_LINK = ("没有识别到有效的认证链接。"
+                      "请粘贴以 http:// 或 https:// 开头的完整认证链接。")
+ERR_PORTAL_SCHEME = "只支持 http/https 链接，当前是「%s」。"
+ERR_PORTAL_HOST = "链接里的主机「%s」不是合法的域名或 IP 地址。"
+ERR_PORTAL_PORT = "链接里的端口「%s」无效（应为 1–65535）。"
+ERR_PORTAL_IPV6 = "链接里的 IPv6 地址缺少方括号，请写成 https://[地址]/… 的形式。"
+WARN_PORTAL_NOT_EPORTAL = "未检测到锐捷 ePortal 链接特征，请确认这是校园网认证链接。"
+
+SCAN_LIMIT = 4096                 # 只扫描前 4096 字符，避免粘贴超大文本卡住界面
+_ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+# 复制时常被一起带上的成对引号/尖括号/中文书名号，首尾一并去掉
+_LINK_EDGE_CHARS = "\"'<>“”‘’《》【】()"
+# 粘在链接尾部、但不属于链接的标点（中文句子里的"点击…登录"这类）
+_LINK_TAIL_CHARS = ").,;，。；、）】>\"'”’》"
+# 判断"像不像锐捷 ePortal 链接"的特征词，只用于软提示
+_EPORTAL_HINTS = ("eportal", "portal", "cas-sso", "wlanuserip", "nasip",
+                  "userip", "sessionid")
+_RE_HTTP_LINK = re.compile(r"https?://[^\s'\"<>]+", re.I)
+_RE_ANY_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*)://")
+_RE_NETLOC = re.compile(r"^(?:[^@/?#]*@)?(\[[^\]]*\]|[^:?#/]*)(?::([^?#/]*))?$")
+_RE_DOMAIN_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?$")
+
+
+def _clean_link_text(text):
+    """PR-1 预处理：去零宽字符，全角字符 NFKC 归一，解 HTML 实体，剥首尾成对引号
+
+    从 PDF / Word / 微信里复制出来的链接常是全角：`ＨＴＴＰＳ：／／sam.ahpu.edu.cn／
+    eportal／x？a=1`。NFKC 会把全角字母、数字、标点一起压成半角，比逐个替换可靠；
+    正文字符（汉字、日文假名）不受影响，正常 ASCII 链接的归一结果就是它自己。
+    """
+    s = str(text or "")
+    for ch in _ZERO_WIDTH_CHARS:
+        if ch in s:
+            s = s.replace(ch, "")
+    s = unicodedata.normalize("NFKC", s)
+    # NFKC 已覆盖下面两个全角符号，显式替换保留着当兜底（幂等，无副作用）
+    s = s.replace("\uff1a", ":").replace("\uff0f", "/")   # 全角 ： ／
+    s = s.replace("&amp;", "&").replace("&AMP;", "&")
+    s = s.strip()[:SCAN_LIMIT]
+    # 首尾可能套了多层引号/书名号，循环剥到不再变化为止
+    prev = None
+    while prev != s:
+        prev = s
+        s = s.strip().strip(_LINK_EDGE_CHARS).strip()
+    return s
+
+
+def _valid_ipv4(host):
+    """逐段校验的合法 IPv4（区别于只判形态的 _ip_literal）"""
+    parts = (host or "").split(".")
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p.isdigit() or len(p) > 3 or (len(p) > 1 and p[0] == "0"):
+            return False
+        if int(p) > 255:
+            return False
+    return True
+
+
+def _valid_host(host):
+    """PR-5 主机校验：合法 IPv4 / IPv6 / 域名（额外放行 localhost）"""
+    host = (host or "").lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    if ":" in host:                       # IPv6 字面量（urlsplit 已去掉方括号）
+        import ipaddress
+        try:
+            ipaddress.IPv6Address(host)
+            return True
+        except ValueError:
+            return False
+    if _valid_ipv4(host):
+        return True
+    labels = host.split(".")
+    if len(labels) < 2:
+        return False
+    if len(labels) == 4 and all(p.isdigit() for p in labels):
+        return False                      # 形如 IPv4 但取值非法（如 256.1.1.1）
+    if labels[-1].isdigit():
+        return False                      # 顶级域不能是纯数字
+    for label in labels:
+        if not label or len(label) > 63 or not _RE_DOMAIN_LABEL.match(label):
+            return False
+    return True
+
+
+def _split_netloc(netloc):
+    """把 netloc 拆成 (host 原文, port 原文)
+
+    保留方括号（IPv6 重建时要用），port 原文用于报错文案——urlsplit().port 只会
+    抛 ValueError，拿不到用户到底写了什么。
+    """
+    matched = _RE_NETLOC.match(netloc or "")
+    if not matched:
+        return (netloc or ""), ""
+    return matched.group(1) or "", matched.group(2) or ""
+
+
+def _parse_origin(candidate):
+    """把候选链接截成 origin（PR-3/PR-4/PR-5）
+
+    返回 (portal, kind, arg)：kind 为 "ok" / "scheme" / "ipv6" / "empty" /
+    "host" / "port"；成功时 portal 是 origin、arg 为空串；失败时 portal 为空串、
+    arg 是原始片段（协议前缀 / 主机名 / 端口号），由上层拼成固定的失败文案。
+    """
+    try:
+        parts = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return "", "host", _split_netloc((candidate or "").split("://")[-1])[0]
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return "", "scheme", scheme + "://"
+    port_raw = _split_netloc(parts.netloc)[1]
+    host = (parts.hostname or "").lower().rstrip(".")
+    # 端口原文里出现冒号有两种可能，别一棍子打成"IPv6 语法错"：
+    #   a) 裸 IPv6（https://2001:db8::1/x）会被 urlsplit 拆成 host=2001 /
+    #      port=db8::1，此时 host 本身不合法 → 提示补方括号；
+    #   b) 端口笔误（https://sam.ahpu.edu.cn:8:0/x）host 是合法域名/IP，
+    #      只是端口里多打了冒号 → 报端口无效，指向才对。
+    if ":" in port_raw:
+        if _valid_host(host):
+            return "", "port", port_raw
+        return "", "ipv6", ""
+    if not host:                          # "https://" / "https:///x" 这类空主机
+        return "", "empty", ""
+    if not _valid_host(host):
+        return "", "host", host
+    port = 0
+    if port_raw:
+        try:
+            port = parts.port
+        except ValueError:
+            return "", "port", port_raw
+        if not port or not (1 <= port <= 65535):
+            return "", "port", port_raw
+    netloc = "[%s]" % host if ":" in host else host
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = 0                          # PR-4：默认端口不写进 origin
+    if port:
+        netloc += ":%d" % port
+    return "%s://%s" % (scheme, netloc), "ok", ""
+
+
+def _is_default_portal(portal):
+    """origin 的主机是不是默认门户（本校）主机
+
+    `https://sam.ahpu.edu.cn/#/login` 这种本校门户的裸地址/前端路由里本来就不会出现
+    eportal 之类的特征词，不该被当成"不是校园网认证链接"来提示。
+    """
+    host = (urllib.parse.urlsplit(portal or "").hostname or "").lower()
+    default_host = (urllib.parse.urlsplit(DEFAULT_PORTAL).hostname or "").lower()
+    return bool(host) and host == default_host
+
+
+def _success_result(portal, text, candidate, added_scheme):
+    """构造解析成功的结果：detail 说明丢了什么，warning 做 ePortal 特征软提示"""
+    path = ""
+    n_params = 0
+    fragment = ""
+    try:
+        parts = urllib.parse.urlsplit(candidate)
+        path = (parts.path or "").strip()
+        if path in ("", "/"):
+            path = ""
+        query = parts.query or ""
+        if query:
+            n_params = len([seg for seg in query.split("&") if seg.strip()])
+        fragment = (parts.fragment or "").strip()
+    except ValueError:
+        path, n_params, fragment = "", 0, ""
+
+    steps = []
+    if added_scheme:
+        steps.append("已补全 https://")
+    if path and n_params:
+        steps.append("已忽略路径与 %d 个参数" % n_params)
+    elif n_params:
+        steps.append("已忽略 %d 个参数" % n_params)
+    elif path:
+        steps.append("已忽略路径")
+    if fragment:
+        steps.append("已忽略 # 锚点")      # 前端路由锚点（如 #/login）同样要丢
+    detail = "，".join(steps) if steps else "链接已是纯认证地址"
+
+    warning = ""
+    # 只有真的丢弃了东西才做特征检查：已是纯 origin 的输入不该再加提示（PR-8）。
+    # 本校门户主机（如 https://sam.ahpu.edu.cn/#/login）直接豁免，避免自相矛盾。
+    if (path or n_params or fragment) and not _is_default_portal(portal) and not any(
+            k in (text or "").lower() for k in _EPORTAL_HINTS):
+        warning = WARN_PORTAL_NOT_EPORTAL
+    return ParseResult(portal, "", warning, detail)
+
+
+def parse_portal_link(text):
+    """把用户粘贴的完整认证链接解析为有效认证地址（origin）。
+
+    portal:  成功时的认证地址（失败为 ""）
+    error:   失败原因（成功为 ""）
+    warning: 软提示（可为 ""，例如"不是 ePortal 链接"）
+    detail:  成功时的说明（例如"已忽略路径与 6 个参数"）
+
+    纯函数：不读配置、不发网络请求、不返回链接原文（原文里的 sessionId /
+    mac / wlanuserip 不能进日志）。
+    """
+    s = _clean_link_text(text)
+    if not s:
+        return ParseResult("", ERR_PORTAL_EMPTY, "", "")
+
+    # PR-2：优先找第一个 http(s) 链接；host 非法的候选跳过、继续试下一个
+    first_err = ("", "")
+    pos = 0
+    while True:
+        found = _RE_HTTP_LINK.search(s, pos)
+        if not found:
+            break
+        candidate = found.group(0).rstrip(_LINK_TAIL_CHARS)
+        portal, kind, arg = _parse_origin(candidate)
+        if kind == "ok":
+            return _success_result(portal, s, candidate, False)
+        if not first_err[0]:
+            first_err = (kind, arg)
+        pos = found.end()
+    if first_err[0] == "host":
+        return ParseResult("", ERR_PORTAL_HOST % (first_err[1] or ""), "", "")
+    if first_err[0] == "port":
+        return ParseResult("", ERR_PORTAL_PORT % (first_err[1] or ""), "", "")
+    if first_err[0] == "ipv6":
+        return ParseResult("", ERR_PORTAL_IPV6, "", "")
+    if first_err[0] == "scheme":
+        return ParseResult("", ERR_PORTAL_SCHEME % first_err[1], "", "")
+    if first_err[0] == "empty":
+        # "https://" / "https:///x"：没有主机，归到"没识别到有效链接"
+        return ParseResult("", ERR_PORTAL_NO_LINK, "", "")
+
+    # 没有 http(s) 链接：先看是不是别的协议，给"只支持 http/https"的明确提示。
+    # 先做 "://" 的廉价短路：整串没有 :// 时这条正则没必要跑（超长无空格文本下
+    # 回溯会到几十毫秒）。
+    if "://" in s:
+        other = _RE_ANY_SCHEME.search(s)
+        if other and other.group(1).lower() not in ("http", "https"):
+            return ParseResult("", ERR_PORTAL_SCHEME % (other.group(1).lower() + "://"),
+                               "", "")
+
+    # PR-2 兜底：用户只复制了 sam.ahpu.edu.cn/eportal/index.jsp?…（没有协议头）。
+    # 仅当整串不含空白、且首段确实像个主机时才补 https://。主机的判定口径与
+    # _valid_host 保持一致：含点 / IP 字面量 / localhost。
+    if not any(ch.isspace() for ch in s):
+        head = re.split(r"[/?#]", s, 1)[0]
+        host_head = _split_netloc(head)[0].strip("[]").rstrip(".").lower()
+        if "." in host_head or _ip_literal(host_head) or host_head == "localhost":
+            candidate = "https://" + s
+            portal, kind, arg = _parse_origin(candidate)
+            if kind == "ok":
+                return _success_result(portal, s, candidate, True)
+            if kind == "port":
+                return ParseResult("", ERR_PORTAL_PORT % (arg or ""), "", "")
+            if kind == "ipv6":
+                return ParseResult("", ERR_PORTAL_IPV6, "", "")
+            # host 非法（含"主机没有点"）：与"找不到链接"归为一类
+    return ParseResult("", ERR_PORTAL_NO_LINK, "", "")
 
 
 # 允许跟随重定向 / 外发 Cookie 的主机白名单：门户域名及其子域 + 网关 IP 字面量。
@@ -1420,8 +1721,20 @@ class CampusApp(tk.Tk):
         self.service_box = ttk.Combobox(form, textvariable=self.service_var,
                                         values=DEFAULT_SERVICES,
                                         state="readonly", width=30)
+        # 认证地址行：输入框 + 「解析链接」按钮放在同一个 grid 单元格里。
+        # 用户常常把浏览器地址栏里那一整串（带 wlanuserip/nasip/mac/sessionId 等
+        # 一次性参数）直接粘进来，按一下按钮就能截成 https://sam.ahpu.edu.cn。
+        # 输入框宽度 32 → 24：让出按钮的位置后整行宽度与下面几行大致齐平。
+        portal_row = ttk.Frame(form)
+        self.portal_entry = ttk.Entry(portal_row, textvariable=self.portal_var, width=24)
+        self.portal_entry.pack(side="left", fill="x", expand=True)
+        self.portal_entry.bind("<<Paste>>", self._on_portal_paste)
+        self.parse_btn = ttk.Button(portal_row, text="解析链接", width=8,
+                                    command=self.on_parse_portal)
+        self.parse_btn.pack(side="right", padx=(6, 0))
+
         rows = [
-            ("认证地址：", ttk.Entry(form, textvariable=self.portal_var, width=32)),
+            ("认证地址：", portal_row),
             ("学　号：", ttk.Entry(form, textvariable=self.user_var, width=32)),
             ("密　码：", ttk.Entry(form, textvariable=self.pass_var, width=32, show="*")),
             ("运营商：", self.service_box),
@@ -1604,8 +1917,97 @@ class CampusApp(tk.Tk):
         self._append("提示：填写学号与密码后点击「保存并登录」；开机自启状态：%s" % (
             "已开启" if autostart_enabled() else "未开启"))
 
+    # ---------- 认证地址解析 ----------
+
+    def _clipboard_text(self):
+        """读剪贴板文本；没有剪贴板/被别的程序占住时返回空串，绝不抛异常"""
+        try:
+            value = self.clipboard_get()
+        except Exception:
+            return ""
+        return str(value or "").strip()
+
+    def on_parse_portal(self):
+        """「解析链接」按钮：把输入框里的完整认证链接截成认证地址"""
+        self._parse_portal(manual=True)
+
+    def _parse_portal(self, manual=True):
+        """解析认证地址：优先输入框，其次剪贴板（用户常常只是复制了链接没粘进来）
+
+        manual=True  —— 点按钮触发：什么都没有时明确提示，失败时弹警告框；
+        manual=False —— 粘贴后自动触发：失败时静默（保留原文，用户可点按钮看原因）。
+
+        隐私：日志只写解析出的 origin 与"丢弃了几个参数"，绝不回吐链接原文
+        （原文里带 sessionId / mac / wlanuserip）；全程不发网络请求。
+        """
+        text = (self.portal_var.get() or "").strip()
+        if not text:
+            text = self._clipboard_text()
+        if not text:
+            if manual:
+                messagebox.showwarning(
+                    "无法解析链接",
+                    "请先粘贴完整的网络认证链接，再点击「解析链接」。", parent=self)
+            return None
+
+        result = parse_portal_link(text)
+        if not result.portal:
+            if manual:
+                messagebox.showwarning("无法解析链接", result.error, parent=self)
+            return None
+
+        current = (self.portal_var.get() or "").strip()
+        if result.portal != current:
+            self.portal_var.set(result.portal)
+            try:                                   # 光标与视图都挪到末尾
+                self.portal_entry.icursor("end")
+                self.portal_entry.xview("end")
+            except Exception:
+                pass
+            self._append("认证地址已解析为 %s（%s）" % (result.portal, result.detail))
+        else:
+            self._append("认证地址已是纯认证地址：%s" % result.portal)
+        if result.warning:
+            self._append("提示：%s" % result.warning)
+        return result.portal
+
+    def _on_portal_paste(self, event=None):
+        """认证地址框的 <<Paste>> 处理：粘进来的是"完整链接"就自动解析一次
+
+        返回 None 让默认粘贴照常执行；真正的内容检查推迟到 after_idle，
+        那时输入框里已经是粘贴后的文本。
+        """
+        self.after_idle(self._auto_parse_portal_after_paste)
+        return None
+
+    def _auto_parse_portal_after_paste(self):
+        """粘贴后自动解析（静默失败）：出现 ? 或 /eportal 等路径才动手，
+        避免用户只是想改个端口/主机时被无谓地改写。
+
+        标记匹配前先过 _clean_link_text（NFKC 归一半角）：从 PDF / Word / 微信复制
+        出来的是 `ＨＴＴＰＳ：／／…／ｅｐｏｒｔａｌ／ｘ？…`，全角标记直接匹配是匹配不到的。
+        """
+        text = _clean_link_text(self.portal_var.get() or "").lower()
+        if not any(mark in text for mark in ("?", "/eportal", "/cas-sso", "/portal/")):
+            return
+        self._parse_portal(manual=False)
+
     def _collect_config(self):
-        portal = normalize_portal(self.portal_var.get())
+        raw_portal = (self.portal_var.get() or "").strip()
+        # 明显非法（写了 :// 却解析不出 origin：http:// 、ftp:// 、主机/端口非法）
+        # 就在保存前拦住，让用户看到具体原因——否则 "http://" 会被下面的宽松兜底
+        # 变成 "https://http:" 写进 config.json，下次启动只会报一个莫名其妙的失败。
+        # 不含 :// 的输入（如内网单标签主机名 portal）不做校验，保持宽松。
+        if "://" in raw_portal:
+            parsed = parse_portal_link(raw_portal)
+            if not parsed.portal:
+                raise ValueError(parsed.error)
+        portal = normalize_portal(raw_portal)
+        # 兜底：用户可能没点「解析链接」就直接保存/登录。把截断后的 origin 回写
+        # 输入框，保证 config.json 里永远是 origin，而不是带 wlanuserip 的完整链接。
+        if portal and portal != raw_portal:
+            self.portal_var.set(portal)
+            self._append("认证地址已自动去除路径与参数：%s" % portal)
         user = self.user_var.get().strip()
         password = self.pass_var.get()
         if not portal or not user or not password:

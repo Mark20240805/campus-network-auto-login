@@ -14,8 +14,10 @@ py -3.12 -m pytest          # 或 python -m pytest
 
 | 文件 | 覆盖内容 |
 |------|---------|
-| `test_core.py` | 退避算法、日志脱敏（幂等 + 白名单覆盖）、入口归一化、`_ip_literal`、重定向限域（B4）、Cookie 主机隔离（B4）、失败分类（B1） |
+| `test_core.py` | 退避算法、日志脱敏（幂等 + 白名单覆盖）、入口归一化、认证链接解析（ePortal 完整链接 → origin，8 个真实样本 + 失败文案 + 幂等 + 全角 NFKC 归一 + 空主机 + 未加方括号 IPv6 + `#` 锚点计入 detail + 本校门户豁免软提示 + `localhost` 兜底 + 端口笔误与 IPv6 的区分 + `"://"` 短路）、`_ip_literal`、重定向限域（B4）、Cookie 主机隔离（B4）、失败分类（B1） |
 | `test_config_log.py` | 配置保存（空值保留旧密文）、明文迁移、原子写、日志轮转（保留 3 份）、`scrub_log` 幂等收敛 |
+| `test_portal_parse_edge.py` | 解析边界：userinfo（`user:pass@`）剥离、IPv6 + 非默认端口、网关 IP 保留 http、FQDN 末尾点、一段文字里多个链接（跳过非法候选）、超长粘贴耗时上限；两条不变量——解析绝不发网络请求、返回值不含 `sessionId`/`mac`/`wlanuserip` 原文、`normalize_portal` 老语义兜底、`_redact` 不误伤 origin |
+| `test_portal_parse_ui.py` | UI 接线（Fake 对象，不实例化 `CampusApp`）：「解析链接」按钮的六条链路（有链接 / 读剪贴板兜底 / 双空提示 / 失败不改输入框 / 已是 origin 不重复写 / 软警告仍填入）、粘贴自动解析的触发条件、`_collect_config` 保存时截断回写、保存前拦截写了 `://` 却解析不出 origin 的地址（`http://`/`ftp://`/主机/端口非法）；不含 `://` 的单标签主机名（如内网 `portal`）仍放行；粘贴后自动解析对全角链接同样生效 |
 
 ## 设计要点
 
