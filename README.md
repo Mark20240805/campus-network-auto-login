@@ -6,6 +6,10 @@
 > 许可证为 **PolyForm Noncommercial 1.0.0**（全文见 [LICENSE](LICENSE)）：个人学习、教学与
 > 非商业用途可用；**禁止商业使用**；软件按"原样"提供，不附带任何担保。
 
+| 主窗口 | 托盘右键菜单 |
+|---|---|
+| ![主窗口](docs/screenshot-main.png) | ![托盘菜单](docs/screenshot-tray.png) |
+
 ## 功能特性
 
 - **图形界面配置**：认证地址、学号、密码、运营商均可自定义，保存为 `config.json`
@@ -236,6 +240,29 @@ POST /eportal/network/userOnline       {sessionId}          → online=true
   `sessionId`，程序会自动轮询等待（最长约 40 秒）
 - 点「下线」后 `userOnline` 会立刻变 false，但网关真正释放会话还要 5~6 秒，
   排查时请等 10~15 秒再抓包（`autodiag` 已内置这段稳定期）
+
+### 常态请求特征（每 60 秒的轮询）
+
+挂机运行时程序**每 60 秒**做一次在线检测，每次 tick 向
+`sam.ahpu.edu.cn/eportal/` 发 **2~3 个请求**：
+
+```
+GET  /eportal/redirect.jsp                     取会话（302 Location 里的 sessionId）
+POST /eportal/network/userOnline               查是否在线
+GET  /eportal/adaptor/getOnlineUserInfo?…      仅已在线时补查用户名
+```
+
+- 属于稳定的小流量（约 2~3 请求/分钟），网关完全无感，但**可被识别为自动客户端**；
+  离线退避期间请求更少（最长 15 分钟才一次）
+- 间隔由主程序顶部的常量控制，**源码用户改一行即可调整**：
+
+```python
+# 校园网自动登录.py 第 146 行附近
+MONITOR_INTERVAL = 60000  # 断线检测间隔（毫秒）→ 改成 300000 就是每 5 分钟一次
+```
+
+- 用打包版 exe 的同学改不了这个常量（值已编译进二进制），想自定义请参照
+  [自行打包 exe](#自行打包-exe) 一节从源码重新编译
 
 ## 启动耗时（实测）
 
@@ -553,6 +580,22 @@ Import-Certificate -FilePath .\CampusNet-自签名证书.cer -CertStoreLocation 
 > `certmgr.msc → 受信任的根证书颁发机构 → 证书` 里删掉。
 > 仓库里 `tools\CampusNet-自签名证书.cer` 只有公钥（`HasPrivateKey = False`），
 > 私钥在本机证书库中，不进仓库；也**别让任何人把他的根证书装进你的电脑**。
+
+### 自签名证书的固有限制（请知悉）
+
+本项目用**自签名证书**签名，这类证书有几点天生的限制，与本项目做得好不好无关：
+
+- **没有第三方背书**：自签名只能证明「同一个私钥签出来的」，不能像 DigiCert/Sectigo
+  那样证明「发布者身份经过了审核」。发布者名字（`CampusNet AutoLogin`）是自填的
+- **SmartScreen 信誉不会积累**：正规签名要靠下载量积累信誉，自签名永远弹
+  「未知发布者」，这是 Windows 的预期行为，不代表文件有毒，也不代表没毒
+- **无吊销基础设施**：没有 CRL/OCSP，私钥一旦泄露没有全网自动失效机制
+- **签名不等于安全**：签名验证的是「文件自发布后没被篡改」，不保证文件本身无恶意
+
+所以：**不想看弹窗、也不想装任何证书的同学，最稳妥的做法是自己审查源码后自行编译**
+（见上文[自行打包 exe](#自行打包-exe) 一节，三种打包方式任选）。自己编译的产物与
+你审查过的源码一一对应，不依赖对任何人的信任；发布版与源码的对应关系可以用
+Release 附带的 `SHA256SUMS.txt` 核对。
 
 ### 买了正规证书怎么签
 
