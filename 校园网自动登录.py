@@ -102,8 +102,11 @@ def tray_available():
     return TRAY_AVAILABLE
 
 
-IS_FROZEN = getattr(sys, "frozen", False)
-if IS_FROZEN:  # PyInstaller 打包后，资源放在 exe 同目录
+# PyInstaller 会设 sys.frozen；Nuitka 官方明确不设（改用模块属性 __compiled__）。
+# 只认 sys.frozen 的话，Nuitka 打包版会被当成"源码运行"，自启命令里会写出一个
+# 并不存在的 .py 参数（旧版 1.0.3 打包版就因此写出了错误的开机自启命令）。
+IS_FROZEN = bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+if IS_FROZEN:  # 打包后（PyInstaller / Nuitka），资源放在 exe 同目录
     SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -141,7 +144,7 @@ def cleanup_stale_mei():
         pass
 
 DEFAULT_PORTAL = "https://sam.ahpu.edu.cn"
-APP_VERSION = "1.0.3"      # 发版时和 installer\campusnet.iss、tools\version_info.txt 一起改
+APP_VERSION = "1.0.4"      # 发版时和 installer\campusnet.iss、tools\version_info.txt 一起改
 # 兜底列表：正常从 serviceSelection 接口实时拉取
 DEFAULT_SERVICES = ["校园网", "中国电信", "中国移动", "中国联通"]
 # 新建配置的默认出口：没办运营商套餐的同学走校园网。
@@ -1565,6 +1568,93 @@ def autostart_enabled():
     return autostart_registered_value() is not None
 
 
+def autostart_targets(value):
+    """从自启命令里取出"必须存在"的文件路径
+
+    带引号的按引号切；没引号的按空格切，并丢掉 --login 这类参数。
+    """
+    if not value:
+        return []
+    parts = re.findall(r'"([^"]+)"', value)
+    if not parts:
+        parts = value.split()
+    return [p for p in parts if not p.startswith("-")]
+
+
+def autostart_policy_disabled():
+    """Windows「启动应用」里是否被禁用（StartupApproved 首字节为奇数）
+
+    任务管理器 / 电脑管家把启动项关掉时，Run 键仍然存在，只在这里打标记，
+    所以"注册表有值"不等于"开机真的会跑"。
+    """
+    if not winreg:
+        return False
+    key = (r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+           r"\StartupApproved\Run")
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            data, _ = winreg.QueryValueEx(k, AUTOSTART_NAME)
+    except OSError:
+        return False
+    return bool(data) and data[0] % 2 == 1
+
+
+def clear_autostart_policy_disabled():
+    """把「启动应用」里的禁用标记清回启用（02 00 ...）
+
+    只把 Run 键写对还不够：任务管理器/电脑管家那边仍标着"已禁用"的话，
+    开机照样不会跑。写回 02 是 Windows 自己的"启用"编码。
+    """
+    if not winreg:
+        return False
+    key = (r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+           r"\StartupApproved\Run")
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_BINARY,
+                              b"\x02" + b"\x00" * 11)
+        return True
+    except OSError:
+        return False
+
+
+def autostart_problems(value=None):
+    """自启项体检：返回问题列表，空列表表示正常"""
+    value = autostart_registered_value() if value is None else value
+    if value is None:
+        return ["注册表里没有自启项"]
+    problems = []
+    if value != autostart_cmd():
+        problems.append("命令指向别处: %s" % value)
+    missing = [p for p in autostart_targets(value) if not os.path.exists(p)]
+    if missing:
+        problems.append("目标文件不存在: %s" % "、".join(missing))
+    if autostart_policy_disabled():
+        problems.append("被 Windows「启动应用」禁用")
+    return problems
+
+
+def verify_autostart_delayed(delay=3.0):
+    """写入几秒后复查一次：部分安全软件会延迟把自启项改回去"""
+    expected = autostart_cmd()
+
+    def run():
+        time.sleep(delay)
+        try:
+            current = autostart_registered_value()
+        except Exception:
+            return
+        if current != expected:
+            log("开机自启项几秒后被改回（%s），可能被电脑管家/安全软件拦截"
+                % (current or "空"))
+
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except Exception:
+        pass
+
+
 def refresh_autostart_if_enabled(cfg=None):
     """启动时自愈：配置里开了自启，就把注册表项按当前路径重写一遍
 
@@ -1573,16 +1663,23 @@ def refresh_autostart_if_enabled(cfg=None):
     cfg = cfg if cfg is not None else load_config()
     if not cfg.get("autoStart"):
         return False
-    if autostart_registered_value() == autostart_cmd():
+    problems = autostart_problems()
+    if not problems:
         return False
     if set_autostart(True):
+        clear_autostart_policy_disabled()
         log("已按当前程序位置更新开机自启项")
         return True
+    log("开机自启自愈失败：%s" % "；".join(problems))
     return False
 
 
 def set_autostart(enable):
-    """写入/删除注册表 HKCU Run 启动项，返回是否成功"""
+    """写入/删除注册表 HKCU Run 启动项，返回是否成功
+
+    写完立刻回读：电脑管家类软件会"保护"启动项，把刚写入的值静默改回去，
+    所以 SetValueEx 不报错并不代表真的生效；成功后再挂一个延迟复查。
+    """
     if not winreg:
         return False
     try:
@@ -1595,6 +1692,17 @@ def set_autostart(enable):
                     winreg.DeleteValue(k, AUTOSTART_NAME)
                 except OSError:
                     pass
+        current = autostart_registered_value()
+        if enable and current != autostart_cmd():
+            log("开机自启写入后被改回（%s），可能被电脑管家/安全软件拦截"
+                % (current or "空"))
+            return False
+        if not enable and current is not None:
+            log("开机自启项删除后被还原（%s），可能被电脑管家/安全软件拦截"
+                % current)
+            return False
+        if enable:
+            verify_autostart_delayed()
         return True
     except OSError as e:
         log("设置开机自启失败: %s" % e)
@@ -1843,7 +1951,13 @@ class CampusApp(tk.Tk):
             self.on_check()
         elif name == "toggle_autostart":
             enable = not autostart_enabled()
-            set_autostart(enable)
+            ok = set_autostart(enable)
+            if enable and ok:
+                clear_autostart_policy_disabled()
+            elif enable:
+                self._notify("开机自启未生效",
+                             "自启项写入后被改回，可能被电脑管家类软件拦截，"
+                             "请在「启动项管理」里放行后重试")
             self.autostart_var.set(enable)
             cfg = load_config()
             cfg["autoStart"] = enable
@@ -2206,7 +2320,13 @@ class CampusApp(tk.Tk):
         self.next_retry_at = 0.0
         self.need_manual = False
         if cfg["autoStart"]:
-            state = "已开启" if set_autostart(True) else "开启失败"
+            if set_autostart(True):
+                clear_autostart_policy_disabled()
+                state = "已开启"
+            else:
+                state = "开启失败（可能被电脑管家类软件拦截）"
+                self._notify("开机自启未生效",
+                             "自启项写入后被改回，请在电脑管家「启动项管理」里放行")
         else:
             set_autostart(False)
             state = "已关闭"
@@ -2358,6 +2478,16 @@ def selftest_report():
                      % (cfg.get("userId"), cfg.get("service") or DEFAULT_SERVICE))
     else:
         lines.append("配置: 未完成（缺学号或密码），请先在配置窗口填写")
+
+    lines.append("运行方式: %s" % ("打包 exe" if IS_FROZEN else "源码运行"))
+    value = autostart_registered_value()
+    if value is None:
+        auto_detail = "未设置"
+    else:
+        problems = autostart_problems(value)
+        auto_detail = "正常" if not problems else "；".join(problems)
+    lines.append("开机自启: 配置%s，%s"
+                 % ("开启" if cfg.get("autoStart") else "关闭", auto_detail))
 
     ips = local_ipv4_list()
     lines.append("本机地址: %s%s"
