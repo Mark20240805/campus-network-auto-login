@@ -106,9 +106,39 @@ def tray_available():
 # 只认 sys.frozen 的话，Nuitka 打包版会被当成"源码运行"，自启命令里会写出一个
 # 并不存在的 .py 参数（旧版 1.0.3 打包版就因此写出了错误的开机自启命令）。
 IS_FROZEN = bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+
+
+def _packaged_exe_path():
+    """打包版真实可执行文件路径
+
+    Nuitka 打包后 sys.executable 可能仍指向打包时用的 python.exe（本项目实测：
+    指向 E:\\CampusNetAutoLogin\\python.exe），直接用它会让 config.json / login.log
+    和开机自启项都落到构建机的路径上。这里优先用 Win32 取当前进程的真实模块路径，
+    再退回 sys.argv[0]、sys.executable。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes as _ct
+            buf = _ct.create_unicode_buffer(32768)
+            n = _ct.windll.kernel32.GetModuleFileNameW(None, buf, len(buf))
+            if n and os.path.exists(buf.value):
+                return buf.value
+        except Exception:
+            pass
+    try:
+        argv0 = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+        if argv0 and os.path.exists(argv0):
+            return argv0
+    except Exception:
+        pass
+    return os.path.abspath(sys.executable)
+
+
 if IS_FROZEN:  # 打包后（PyInstaller / Nuitka），资源放在 exe 同目录
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    APP_EXE = _packaged_exe_path()
+    SCRIPT_DIR = os.path.dirname(APP_EXE)
 else:
+    APP_EXE = ""
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "login.log")
@@ -1549,7 +1579,7 @@ def autostart_cmd():
     - 源码运行     → pythonw.exe + 当前 .py 路径
     """
     if IS_FROZEN:
-        return '"%s" --login' % os.path.abspath(sys.executable)
+        return '"%s" --login' % APP_EXE
     return '"%s" "%s" --login' % (pythonw_path(), os.path.abspath(__file__))
 
 
