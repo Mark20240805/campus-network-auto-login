@@ -20,12 +20,12 @@ VSVersionInfo(
           '080404b0',
           [StringStruct('CompanyName', 'CampusNet AutoLogin'),
            StringStruct('FileDescription', '校园网自动认证系统'),
-           StringStruct('FileVersion', '1.0.4.0'),
+           StringStruct('FileVersion', '1.1.0.0'),
            StringStruct('InternalName', 'CampusNetAutoLogin'),
            StringStruct('LegalCopyright', 'Copyright (C) 2026'),
            StringStruct('OriginalFilename', '校园网自动认证系统.exe'),
            StringStruct('ProductName', '校园网自动认证系统'),
-           StringStruct('ProductVersion', '1.0.4.0')])
+           StringStruct('ProductVersion', '1.1.0.0')])
       ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]

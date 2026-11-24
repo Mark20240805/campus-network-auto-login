@@ -13,6 +13,9 @@
   - 托盘图标颜色：绿=在线 灰=离线 红=登录失败（悬停显示详细状态）
   - 断线自动重连：每 60 秒检测，离线按退避策略重连（1/2/4/8/15 分钟）；
     密码错、验证码、出口配置无效属于"重试也没用"，会暂停自动重连等人工处理
+  - DNS 被其他软件改成手动时的两层兜底：域名解析失败自动改连上次成功的 IP
+    （Host/SNI/证书校验仍按域名，不降级安全性）；巡检发现"在校园网内却解析不了
+    门户域名"时托盘告警，右键菜单「修复 DNS」一键把网卡 DNS 恢复成自动获取
   - 关闭配置窗口自动最小化到托盘，不退出程序
 
 认证流程（全部实测验证）：
@@ -174,7 +177,7 @@ def cleanup_stale_mei():
         pass
 
 DEFAULT_PORTAL = "https://sam.ahpu.edu.cn"
-APP_VERSION = "1.0.4"      # 发版时和 installer\campusnet.iss、tools\version_info.txt 一起改
+APP_VERSION = "1.1.0"      # 发版时和 installer\campusnet.iss、tools\version_info.txt 一起改
 # 兜底列表：正常从 serviceSelection 接口实时拉取
 DEFAULT_SERVICES = ["校园网", "中国电信", "中国移动", "中国联通"]
 # 新建配置的默认出口：没办运营商套餐的同学走校园网。
@@ -709,6 +712,156 @@ def local_ipv4_list():
     return ips
 
 
+# ---------------------------------------------------------------- DNS 缓存与回退
+# 背景：加速器、去广告、"防污染 DNS" 类软件会把网卡 DNS 从"自动获取"改成手动。
+# 认证前校园网网关只放行自己的 DNS，改手动后域名全部解析失败：浏览器打不开
+# 认证页，本工具的主流程（全部发往门户域名 sam.ahpu.edu.cn）同样会挂。
+# 这里在连接层做兜底：域名解析失败时改连"上次成功解析到的 IP"。
+# Host 头、TLS SNI、证书校验仍按域名进行——缓存 IP 指向的假服务器拿不出
+# 对应证书，HTTPS 一样会被拒，安全性不降级。缓存持久化在 dns_cache.json，
+# 跨重启生效；只在解析失败时才使用，解析正常时永远走系统解析器。
+_DNS_CACHE_FILE = os.path.join(SCRIPT_DIR, "dns_cache.json")
+_DNS_CACHE_MAX_AGE = 30 * 86400      # 秒，缓存条目有效期（门户 IP 极少变化）
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE = None                    # None=未加载；{host: {"ip": str, "ts": float}}
+_DNS_CACHE_MTIME = {}                # {host: 最后一次成功落盘的 ts}，节流重复写盘
+_DNS_CACHE_DIRTY = False             # 上次写盘失败：后续操作必须重试，防止旧缓存复活
+_DNS_FALLBACK_LOGGED = set()         # 本次运行内已提示过回退的 host，避免日志刷屏
+
+
+def _dns_cache_load():
+    """懒加载持久化的解析缓存（文件损坏/不存在都当空表）"""
+    global _DNS_CACHE
+    if _DNS_CACHE is None:
+        data = {}
+        try:
+            with open(_DNS_CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for host, ent in raw.items():
+                    if (isinstance(host, str) and isinstance(ent, dict)
+                            and isinstance(ent.get("ip"), str)):
+                        data[host.lower()] = {"ip": ent["ip"],
+                                              "ts": float(ent.get("ts") or 0)}
+        except Exception:
+            data = {}
+        _DNS_CACHE = data
+    return _DNS_CACHE
+
+
+def _dns_cache_save():
+    """在缓存锁内原子落盘；失败保留 dirty 标记，下次继续重试。"""
+    global _DNS_CACHE_DIRTY
+    tmp = _DNS_CACHE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_DNS_CACHE, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _DNS_CACHE_FILE)
+        _DNS_CACHE_DIRTY = False
+        return True
+    except Exception as e:
+        _DNS_CACHE_DIRTY = True
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        log("DNS 缓存写入失败（不影响登录）: %s" % e)
+        return False
+
+
+def _dns_cache_put(host, ip):
+    """记录 host 这次解析到的 IP；IP 变化或距上次成功落盘超 24 小时才写盘。"""
+    if not host or not ip or _ip_literal(host):
+        return
+    host = host.lower()
+    with _DNS_CACHE_LOCK:
+        cache = _dns_cache_load()
+        now = time.time()
+        ent = cache.get(host)
+        if ent and ent.get("ip") == ip:
+            ent["ts"] = now
+            if (not _DNS_CACHE_DIRTY
+                    and now - _DNS_CACHE_MTIME.get(host, 0) < 86400):
+                return
+        else:
+            cache[host] = {"ip": ip, "ts": now}
+        # 只有真正写成功才刷新落盘时间；失败时下次同 IP 也会重试。
+        if _dns_cache_save():
+            _DNS_CACHE_MTIME[host] = now
+
+
+def _dns_cache_drop(host):
+    """清除某域名的缓存条目（DNS 被劫持、证书校验失败时防投毒用）"""
+    if not host or _ip_literal(host):
+        return
+    host = host.lower()
+    with _DNS_CACHE_LOCK:
+        existed = _dns_cache_load().pop(host, None) is not None
+        if not existed and not _DNS_CACHE_DIRTY:
+            return
+        _DNS_CACHE_MTIME.pop(host, None)
+        # 即使内存里已没有条目，上次删除写盘失败时也要再写一次，
+        # 否则错误 IP 会在下次启动时从旧文件里复活。
+        _dns_cache_save()
+
+
+def _dns_cache_get(host):
+    """取仍在有效期内的缓存 IP；没有返回 None"""
+    if not host or _ip_literal(host):
+        return None
+    with _DNS_CACHE_LOCK:
+        ent = _dns_cache_load().get(host.lower())
+    if not ent or time.time() - ent.get("ts", 0) > _DNS_CACHE_MAX_AGE:
+        return None
+    return ent["ip"]
+
+
+def _dns_fallback_allowed(host, portal):
+    """只有门户域名族才允许用缓存 IP 兜底（口径与重定向限域的白名单一致）"""
+    host = (host or "").lower()
+    if not host or _ip_literal(host):
+        return False
+    portal_host = (urllib.parse.urlsplit(portal or "").hostname or "").lower()
+    return (host == portal_host or host == "ahpu.edu.cn"
+            or host.endswith(".ahpu.edu.cn"))
+
+
+def _attach_dns_fallback(conn, host, portal):
+    """给 http.client 连接挂"解析失败→缓存 IP"的兜底。
+
+    http.client 的 connect() 通过 conn._create_connection((host, port), …) 建
+    TCP 连接，再用 conn.host 做 TLS SNI 和证书校验。这里只拦截 getaddrinfo
+    的 socket.gaierror；连接拒绝、超时、路由错误不能改用旧 IP 重试。
+    """
+    import socket
+    if not _dns_fallback_allowed(host, portal):
+        return
+    inner = conn._create_connection
+
+    def create(address, timeout=None, source_address=None):
+        try:
+            sock = inner(address, timeout, source_address)
+        except socket.gaierror as first_err:
+            ip = _dns_cache_get(host)
+            if ip:
+                if host not in _DNS_FALLBACK_LOGGED:
+                    _DNS_FALLBACK_LOGGED.add(host)
+                    log("DNS 解析 %s 失败（%s），改用上次成功的 IP %s 兜底"
+                        % (host, first_err, ip))
+                return inner((ip, address[1]), timeout, source_address)
+            raise
+        try:
+            _dns_cache_put(host, sock.getpeername()[0])
+        except Exception:
+            pass                      # 记缓存失败不影响本次请求
+        return sock
+
+    conn._create_connection = create
+
+
 class PortalSession:
     """带 cookie 的 HTTP 会话（CAS 强依赖 SESSION cookie）
 
@@ -770,15 +923,20 @@ class PortalSession:
         scheme = parts.scheme or "https"
         port = parts.port or (443 if scheme == "https" else 80)
         src = (self.local_ip, 0) if self.local_ip else None
+        host = parts.hostname
         if scheme == "https":
-            host = parts.hostname
             ctx = (_SSL_CTX_INSECURE
                    if (_ip_literal(host) or host in _TLS_INSECURE_HOSTS)
                    else _SSL_CTX)
-            return http.client.HTTPSConnection(host, port, timeout=timeout,
+            conn = http.client.HTTPSConnection(host, port, timeout=timeout,
                                                context=ctx, source_address=src)
-        return http.client.HTTPConnection(parts.hostname, port, timeout=timeout,
-                                          source_address=src)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout,
+                                              source_address=src)
+        # DNS 被改成手动导致域名解析失败时，改连缓存 IP（仅门户域名族，
+        # Host/SNI/证书校验仍按域名，见 _attach_dns_fallback）
+        _attach_dns_fallback(conn, host, self.portal)
+        return conn
 
     def request(self, url, data=None, headers=None, follow=True, method=None, _depth=0):
         parts = urllib.parse.urlsplit(url)
@@ -827,6 +985,11 @@ class PortalSession:
             if host and _is_cert_error(e):
                 log("域名 %s 的 TLS 证书校验失败，已拒绝连接（可能被劫持）: %s"
                     % (host, e))
+                # 投毒防护：连接层是"先连上、后验证书"。若 DNS 被劫持（解析
+                # "成功"但返回错误 IP），刚才连上的错误 IP 已被记进缓存，
+                # 之后回退会一直撞这个假 IP。这里清掉该域名的缓存条目，
+                # 让下次解析成功时有机会写入正确 IP。
+                _dns_cache_drop(host)
             return 0, {}, str(e)
 
         loc = hdrs.get("Location") or hdrs.get("location") or ""
@@ -1103,8 +1266,16 @@ def check_online(sess=None):
         if not sid:
             return None, ""
         st, hd, text = sess.post_json("/eportal/network/userOnline", {"sessionId": sid})
-        data = _loads(text).get("data") or {}
-        if not data.get("online"):
+        payload = _loads(text)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        # 只有 2xx + 合法 JSON + 显式布尔值才能下结论。HTTP 0/500、
+        # 无效 JSON、字段缺失都是“无法确认”，不能当成明确离线触发 CAS 重登。
+        if not (200 <= st < 300) or not isinstance(data, dict):
+            return None, ""
+        online = data.get("online")
+        if not isinstance(online, bool):
+            return None, ""
+        if not online:
             return False, ""
         # userOnline 不带用户名，再查一次在线详情（仅在已在线时）
         try:
@@ -1231,10 +1402,10 @@ def cas_login(sess, user, password, info=None):
 
 
 def service_login(sess, sid, service):
-    """第 6 步：把本机授权到指定出口"""
+    """第 6 步：把本机授权到指定出口，保留 HTTP 状态供失败分类。"""
     st, hd, text = sess.post_json("/eportal/network/serviceLogin",
                                  {"sessionId": sid, "service": service})
-    return _loads(text)
+    return st, _loads(text)
 
 
 def do_login(cfg, progress=None, notify=None, force=False):
@@ -1324,28 +1495,39 @@ def do_login(cfg, progress=None, notify=None, force=False):
             progress(service_mismatch.strip())
 
         last_err = ""
+        last_kind = KIND_OTHER
         tried = []
 
         def attempt(sid):
-            """用给定会话尝试授权上线，返回 (成功?, 错误信息)"""
+            """用给定会话尝试授权上线，返回 (成功?, 错误信息, 失败类型)"""
             node = current_node(sess, sid)
             path = node.get("currentNodePath") or ""
             progress("sessionId=%s 流程节点: %s" % (
                 sid, (node.get("currentNodeId") or "空") + ("/" + path if path else "")))
-            res = service_login(sess, sid, service)
+            st, res = service_login(sess, sid, service)
+            if st == 0 or st >= 500:
+                return False, "授权请求网络失败 HTTP %s" % st, KIND_NETWORK
+            if not isinstance(res, dict):
+                res = {}
             data = res.get("data") or {}
-            if res.get("code") == 200 and data.get("authResult") == "success":
+            if not isinstance(data, dict):
+                data = {}
+            if st in (200, 201) and res.get("code") == 200 and data.get("authResult") == "success":
                 online, _uid = check_online(sess)
                 if online:
-                    return True, ""
-                return False, "授权成功但状态校验仍离线"
+                    return True, "", KIND_OK
+                if online is None:
+                    return False, "授权已提交，但在线状态无法确认", KIND_NETWORK
+                return False, "授权成功但状态校验仍离线", KIND_OTHER
             err = (res.get("message") or data.get("authMessage")
-                   or json.dumps(res, ensure_ascii=False)[:200])
+                   or json.dumps(res, ensure_ascii=False)[:200]
+                   or "HTTP %s" % st)
             if "workFlowNode" in err and path == "finish":
                 err += "（设备已在线，认证流程已到 finish 终点；请先下线再登录）"
-            return False, err
+            return False, err, KIND_OTHER
 
-        ok2, err = attempt(sid_before) if sid_before else (False, "无 sessionId")
+        ok2, err, kind2 = attempt(sid_before) if sid_before else (
+            False, "无 sessionId", KIND_NETWORK)
         if ok2:
             msg = "登录成功（出口: %s）" % service
             progress(msg)
@@ -1353,6 +1535,7 @@ def do_login(cfg, progress=None, notify=None, force=False):
                 notify("登录成功", "学号: %s  出口: %s" % (user, service))
             return True, msg, KIND_OK
         last_err = err
+        last_kind = kind2
         tried.append(sid_before)
         progress("认证前会话授权失败: %s" % err)
 
@@ -1364,7 +1547,7 @@ def do_login(cfg, progress=None, notify=None, force=False):
             ",".join(sorted(n for b in sess.cookies.values() for n in b))
             or "无"))
         if sid_after and sid_after not in tried:
-            ok3, err3 = attempt(sid_after)
+            ok3, err3, kind3 = attempt(sid_after)
             if ok3:
                 msg = "登录成功（出口: %s）" % service
                 progress(msg)
@@ -1372,6 +1555,7 @@ def do_login(cfg, progress=None, notify=None, force=False):
                     notify("登录成功", "学号: %s  出口: %s" % (user, service))
                 return True, msg, KIND_OK
             last_err = err3
+            last_kind = kind3
             progress("新会话授权失败: %s" % err3)
 
         msg = "授权上线失败：%s" % (last_err or "未知错误")
@@ -1379,7 +1563,7 @@ def do_login(cfg, progress=None, notify=None, force=False):
             msg += service_mismatch
         if notify:
             notify("登录失败", str(last_err or "未知错误"))
-        return False, msg, (KIND_MANUAL if service_mismatch else KIND_OTHER)
+        return False, msg, (KIND_MANUAL if service_mismatch else last_kind)
 
     except ImportError:
         msg = "缺少依赖 cryptography，请执行 pip install cryptography"
@@ -1419,6 +1603,239 @@ def wait_network(portal, timeout=READY_TIMEOUT):
         time.sleep(PROBE_INTERVAL)
     log("等待认证网关超时（%.1f 秒）" % (time.time() - start))
     return False
+
+
+# ---------------------------------------------------------------- DNS 健康检查与修复
+# 方案2的缓存兜底能"带病工作"，但首次使用（还没有缓存）或缓存过期时仍会卡住。
+# 这里补上主动体检：巡检发现"人已在校园网、门户域名却解析不了"（多半是 DNS
+# 被别的软件改成了手动）就托盘告警；右键菜单「修复 DNS」把持有校园网地址的
+# 网卡 DNS 恢复成"自动获取"，修完自动触发一次登录。
+_DNS_BROKEN_CONFIRM = 2     # 连续几次解析失败才认定 DNS 异常（防单次抖动误报）
+
+
+def _portal_host_of(portal):
+    """认证地址里的主机名（小写）；解析不出返回空串"""
+    return (urllib.parse.urlsplit(normalize_portal(portal) or "").hostname or "").lower()
+
+
+def dns_resolves(host, resolver=None):
+    """域名能否被系统解析器解析（resolver 可注入，便于单测）"""
+    if not host or _ip_literal(host):
+        return True               # IP 门户不依赖 DNS
+    resolve = resolver or _default_resolver
+    try:
+        return bool(resolve(host))
+    except Exception:
+        return False
+
+
+def _default_resolver(host):
+    import socket
+    # 不限定地址族：极少数门户只有 AAAA 记录，限定 AF_INET 会误判 broken
+    infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    return [i[4][0] for i in infos]
+
+
+def check_dns_health(portal, resolver=None):
+    """DNS 体检。
+
+    返回 "ok"（正常，或门户本身是 IP 不依赖 DNS）、"broken"（人在校园网内
+    却解析不了门户域名）、None（不在校园网，无从判断）。
+    """
+    host = _portal_host_of(portal)
+    if not host or _ip_literal(host):
+        return "ok"
+    if not has_campus_ip():
+        return None
+    return "ok" if dns_resolves(host, resolver) else "broken"
+
+
+def _ps_output_decode(b):
+    for enc in ("utf-8", "gbk"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            pass
+    return b.decode("utf-8", "replace")
+
+
+def _run_powershell(script):
+    """同步执行 PowerShell 脚本，返回 (returncode, 输出文本)。上限 30 秒。"""
+    import subprocess
+    flags = 0x08000000 if os.name == "nt" else 0    # CREATE_NO_WINDOW：不闪黑框
+    try:
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-Command", script],
+            capture_output=True, timeout=30, creationflags=flags)
+        out = _ps_output_decode((p.stdout or b"") + (p.stderr or b""))
+        return p.returncode, out
+    except Exception as e:
+        return -1, str(e)
+
+
+def find_campus_adapters():
+    """列出持有校园网 IPv4（10.x）的网卡别名；查询失败返回 None。
+
+    Get-NetIPConfiguration 普通权限可读，不需要管理员。
+    """
+    script = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+              "Get-NetIPConfiguration | Where-Object "
+              "{$_.IPv4Address.IPAddress -like '10.*'} | "
+              "Select-Object -ExpandProperty InterfaceAlias -Unique")
+    code, out = _run_powershell(script)
+    if code != 0:
+        return None
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def _ps_quote(alias):
+    """PowerShell 单引号字面量转义"""
+    return "'" + alias.replace("'", "''") + "'"
+
+
+def _reset_dns_script(aliases):
+    """构造恢复 DNS 的脚本；任一命令失败都以非零退出码报告。"""
+    resets = "; ".join(
+        "Set-DnsClientServerAddress -InterfaceAlias %s -ResetServerAddresses"
+        % _ps_quote(a) for a in aliases)
+    return ("$ErrorActionPreference='Stop'; try { " + resets
+            + "; Clear-DnsClientCache } "
+              "catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }")
+
+
+def is_admin():
+    """当前进程是否已有管理员权限"""
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _wait_elevated_process(kernel32, handle, timeout_s):
+    """等待提权进程并检查退出码；超时时终止自己启动的进程，避免并发修复。"""
+    WAIT_OBJECT_0 = 0
+    WAIT_TIMEOUT = 258
+    rc = kernel32.WaitForSingleObject(handle, int(timeout_s * 1000))
+    if rc == WAIT_TIMEOUT:
+        if not kernel32.TerminateProcess(handle, 1):
+            return False, "命令执行超时，且无法终止旧进程；请重启程序后再试"
+        if kernel32.WaitForSingleObject(handle, 5000) != WAIT_OBJECT_0:
+            return False, "命令执行超时，旧进程未能退出；请重启程序后再试"
+        return False, "命令执行超时，已终止本次修复"
+    if rc != WAIT_OBJECT_0:
+        return False, "等待提权命令失败（Windows 状态 %s）" % rc
+    exit_code = ctypes.wintypes.DWORD()
+    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+        return False, "无法读取提权命令退出码"
+    if exit_code.value != 0:
+        return False, "提权命令执行失败（退出码 %d）" % exit_code.value
+    return True, ""
+
+
+def _run_elevated_powershell(script, timeout_s=60):
+    """提权执行 PowerShell 脚本，返回 (成功?, 说明)。
+
+    已是管理员时直接执行；否则用 ShellExecuteExW 的 runas 弹 UAC，由用户
+    授权后执行并等它结束。用户点"否"返回失败，不抛异常。
+    """
+    if is_admin():
+        code, out = _run_powershell(script)
+        return (code == 0), out
+
+    SEE_MASK_NOCLOSEPROCESS = 0x40
+    SW_HIDE = 0
+
+    class _SHELLEXECUTEINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.wintypes.DWORD),
+            ("fMask", ctypes.wintypes.ULONG),
+            ("hwnd", ctypes.wintypes.HANDLE),
+            ("lpVerb", ctypes.wintypes.LPCWSTR),
+            ("lpFile", ctypes.wintypes.LPCWSTR),
+            ("lpParameters", ctypes.wintypes.LPCWSTR),
+            ("lpDirectory", ctypes.wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", ctypes.wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", ctypes.wintypes.LPCWSTR),
+            ("hkeyClass", ctypes.wintypes.HANDLE),
+            ("dwHotKey", ctypes.wintypes.DWORD),
+            ("hIcon", ctypes.wintypes.HANDLE),
+            ("hProcess", ctypes.wintypes.HANDLE),
+        ]
+
+    # EncodedCommand 避免网卡别名或脚本内容破坏命令行引号。
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    params = ("-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded)
+    info = _SHELLEXECUTEINFO()
+    info.cbSize = ctypes.sizeof(_SHELLEXECUTEINFO)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS
+    info.hwnd = None
+    info.lpVerb = "runas"
+    info.lpFile = "powershell.exe"
+    info.lpParameters = params
+    info.nShow = SW_HIDE
+    shell = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    shell.ShellExecuteExW.argtypes = [ctypes.POINTER(_SHELLEXECUTEINFO)]
+    shell.ShellExecuteExW.restype = ctypes.wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [ctypes.wintypes.HANDLE,
+                                             ctypes.wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = ctypes.wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [
+        ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = ctypes.wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [ctypes.wintypes.HANDLE,
+                                          ctypes.wintypes.UINT]
+    kernel32.TerminateProcess.restype = ctypes.wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    try:
+        if not shell.ShellExecuteExW(ctypes.byref(info)):
+            return False, "未能启动提权命令（可能取消了授权）"
+        if not info.hProcess:
+            return False, "未能启动提权命令"
+        return _wait_elevated_process(kernel32, info.hProcess, timeout_s)
+    finally:
+        try:
+            if info.hProcess:
+                kernel32.CloseHandle(info.hProcess)
+        except Exception:
+            pass
+
+
+def repair_dns(portal, resolver=None, runner=None):
+    """把持有校园网 IP 的网卡 DNS 恢复成"自动获取"，返回 (成功?, 说明)。
+
+    需要管理员权限：已是管理员直接改；不是就弹 UAC 由用户授权执行。
+    改完清系统 DNS 缓存，并验证门户域名已能解析（DHCP 的 DNS 要一两秒
+    才下发，最多重试 3 次）。runner/resolver 可注入，便于单测。
+    """
+    if os.name != "nt":
+        return False, "仅支持 Windows"
+    aliases = find_campus_adapters()
+    if aliases is None:
+        return False, "网卡查询失败（PowerShell 不可用或被禁用）"
+    if not aliases:
+        return False, "没有持有校园网地址（10.x）的网卡，请先接入校园网"
+    elev = runner or _run_elevated_powershell
+    ok, detail = elev(_reset_dns_script(aliases))
+    if not ok:
+        return False, "恢复命令未执行（%s）" % (detail or "可能取消了管理员授权")
+    host = _portal_host_of(portal)
+    if not host or _ip_literal(host):
+        # 门户本身就是 IP：没有"解析"可验证，命令执行完即视为成功
+        log("DNS 已修复: %s 恢复为自动获取（IP 门户，免验证）" % "、".join(aliases))
+        return True, "已把 %s 的 DNS 恢复为自动获取" % "、".join(aliases)
+    for _ in range(3):
+        if dns_resolves(host, resolver):
+            log("DNS 已修复: %s 恢复为自动获取" % "、".join(aliases))
+            return True, "已把 %s 的 DNS 恢复为自动获取" % "、".join(aliases)
+        time.sleep(1)
+    return False, "命令已执行，但 %s 仍解析不了，请手动检查网卡 DNS 设置" % host
 
 
 # ---------------------------------------------------------------- 配置读写
@@ -1810,6 +2227,11 @@ class CampusApp(tk.Tk):
         self.next_retry_at = 0.0   # 下次允许自动重连的时间点（墙钟）
         self.need_manual = False   # 认证类失败：暂停自动重连，等用户手动处理
         self.monitor_busy = False  # 巡检线程是否在跑，慢网络下避免线程叠加
+        self.dns_streak = 0        # DNS 连续解析失败次数（防单次抖动误报）
+        self.dns_broken = False    # 已确认 DNS 异常（告警过一次，恢复前不重复）
+        self.dns_worker = None     # 「修复 DNS」后台线程，避免冻结界面
+        self.status_epoch = 0      # 状态查询代际：丢弃登录/改配置前启动的旧巡检
+        self.relogin_pending = False  # DNS 修复后遇忙：当前工作结束后补一次登录
         self._cas_attempt_date = ""   # 频率闸门：当前累计 CAS 提交次数的日期
         self._cas_attempts = 0        # 频率闸门：当天已提交 CAS 密码的次数
 
@@ -1923,6 +2345,7 @@ class CampusApp(tk.Tk):
             pystray.MenuItem("配置窗口", self._tray_action("show"), default=True),
             pystray.MenuItem("立即登录", self._tray_action("login")),
             pystray.MenuItem("检查状态", self._tray_action("check")),
+            pystray.MenuItem("修复 DNS", self._tray_action("fix_dns")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("开机自动登录", self._tray_action("toggle_autostart"),
                              checked=lambda item: autostart_enabled()),
@@ -1979,6 +2402,8 @@ class CampusApp(tk.Tk):
             self._start_login(from_tray=True)
         elif name == "check":
             self.on_check()
+        elif name == "fix_dns":
+            self._fix_dns_async()
         elif name == "toggle_autostart":
             enable = not autostart_enabled()
             ok = set_autostart(enable)
@@ -2207,6 +2632,8 @@ class CampusApp(tk.Tk):
     def _run_login_thread(self, cfg, notify=False, auto=False):
         if self.worker and self.worker.is_alive():
             return False
+        self.status_epoch += 1       # 让此前启动的巡检结果失效
+        epoch = self.status_epoch
         if not auto:                # 手动登录：清掉退避/熔断，让用户随时能重试
             self.fail_streak = 0
             self.next_retry_at = 0.0
@@ -2222,8 +2649,8 @@ class CampusApp(tk.Tk):
                                            notify=self._notify if notify else None)
             sess = status_session(cfg.get("portalHost") or DEFAULT_PORTAL)
             online, uid = check_online(sess)
-            self.queue.put(("status", online, uid, not ok))
-            self.queue.put(("done", ok, reason, auto))
+            self.queue.put(("status", online, uid, not ok, epoch))
+            self.queue.put(("done", ok, reason, auto, epoch))
 
         self.worker = threading.Thread(target=run, daemon=True)
         self.worker.start()
@@ -2347,6 +2774,7 @@ class CampusApp(tk.Tk):
                                  "无法写入 %s：\n%s" % (CONFIG_FILE, e), parent=self)
             return False
         self.fail_streak = 0        # 配置改过，给自动重连一次新机会
+        self.status_epoch += 1      # 旧门户的巡检结果不能再操作新配置
         self.next_retry_at = 0.0
         self.need_manual = False
         if cfg["autoStart"]:
@@ -2376,13 +2804,15 @@ class CampusApp(tk.Tk):
     def on_check(self):
         if self.worker and self.worker.is_alive():
             return
+        self.status_epoch += 1      # 旧巡检不得覆盖这次主动检查
+        epoch = self.status_epoch
         portal = normalize_portal(self.portal_var.get()) or DEFAULT_PORTAL
         self._set_busy(True)
 
         def run():
             online, uid = check_online(status_session(portal))
-            self.queue.put(("status", online, uid, False))
-            self.queue.put(("done", None))
+            self.queue.put(("status", online, uid, False, epoch))
+            self.queue.put(("done", None, None, False, epoch))
 
         self.worker = threading.Thread(target=run, daemon=True)
         self.worker.start()
@@ -2397,11 +2827,16 @@ class CampusApp(tk.Tk):
                     portal = normalize_portal(self.portal_var.get())
                 if portal:
                     self.monitor_busy = True
+                    epoch = self.status_epoch
 
                     def run():
                         try:
                             online, uid = check_online(status_session(portal))
-                            self.queue.put(("monitor", online, uid))
+                            # 查询失败时顺带体检 DNS：域名解析在后台线程做，
+                            # 别把 Tk 主线程卡住（坏 DNS 下 getaddrinfo 要几秒）
+                            dns_state = (check_dns_health(portal)
+                                         if online is None else None)
+                            self.queue.put(("monitor", online, uid, dns_state, epoch))
                         finally:
                             self.monitor_busy = False
 
@@ -2409,6 +2844,72 @@ class CampusApp(tk.Tk):
         except Exception:
             pass
         self.after(MONITOR_INTERVAL, self._monitor_tick)
+
+    # ---------- DNS 体检与修复 ----------
+
+    def _update_dns_state(self, dns_state):
+        """消化巡检的 DNS 结论：连续失败达阈值才告警一次；恢复即清零。
+
+        告警只在"状态查询失败且 DNS 解析不了"时发生——若方案2的缓存兜底
+        正常工作（能查到在线状态），这里拿到的是 None，不会打扰用户。
+        """
+        if dns_state == "broken":
+            self.dns_streak += 1
+            if self.dns_streak >= _DNS_BROKEN_CONFIRM and not self.dns_broken:
+                self.dns_broken = True
+                log("DNS 异常：人在校园网内却解析不了门户域名（多半被其他软件"
+                    "改成了手动），托盘右键「修复 DNS」可一键恢复自动获取")
+                self._notify("DNS 可能被改坏了",
+                             "域名解析失败，认证会卡住；"
+                             "托盘右键 →「修复 DNS」一键恢复自动获取")
+        elif dns_state == "ok":
+            if self.dns_broken:
+                log("DNS 已恢复正常（巡检确认）")
+            self.dns_streak = 0
+            self.dns_broken = False
+        # None 表示本轮未测或不在校园网，不能当成“已恢复”清零。
+
+    def _fix_dns_async(self):
+        """托盘「修复 DNS」：后台执行体检 + 恢复，结果用气泡反馈。
+
+        PowerShell 与 UAC 都可能花好几秒，绝不能在 Tk 主线程里同步等；
+        修复成功后立刻排一次登录（相当于自动点「立即登录」）。
+        """
+        if self.dns_worker and self.dns_worker.is_alive():
+            return
+        cfg = load_config()
+        portal = normalize_portal(cfg.get("portalHost")) or DEFAULT_PORTAL
+
+        def run():
+            try:
+                state = check_dns_health(portal)
+                if state != "broken":
+                    msg = ("DNS 正常，无需修复" if state == "ok"
+                           else "当前不在校园网，无需修复")
+                    log("修复DNS: " + msg)
+                    self._notify("修复 DNS", msg)
+                    return
+                ok, detail = repair_dns(portal)
+                if ok:
+                    self.queue.put(("dns_fixed", detail))
+                else:
+                    self._notify("DNS 修复失败", detail)
+            except Exception as e:
+                # 后台线程崩掉用户毫无感知，这里兜住转成气泡
+                log("修复DNS 异常: %r" % e)
+                self._notify("修复 DNS", "执行出错：%s" % e)
+
+        self.dns_worker = threading.Thread(target=run, daemon=True)
+        self.dns_worker.start()
+
+    def _drain_dns_relogin(self):
+        """DNS 修复后的补登录：忙则保留 pending，done 后这里会再次调用。"""
+        if not self.relogin_pending:
+            return
+        if self.worker and self.worker.is_alive():
+            return
+        self.relogin_pending = False
+        self._start_login(from_tray=True)
 
     # ---------- 后台消息轮询 ----------
 
@@ -2437,6 +2938,8 @@ class CampusApp(tk.Tk):
         if kind == "log":
             self._append(item[1])
         elif kind == "status":
+            if len(item) > 4 and item[4] != self.status_epoch:
+                return              # 旧工作线程晚到的状态，不覆盖新任务
             self._set_tray_status(item[1], item[2], fail=item[3])
         elif kind == "services":
             cur = self.service_var.get()
@@ -2451,7 +2954,10 @@ class CampusApp(tk.Tk):
                 self.service_var.set(DEFAULT_SERVICE)
             log("可选出口: %s" % "、".join(item[1]))
         elif kind == "monitor":
+            if len(item) > 4 and item[4] != self.status_epoch:
+                return              # 登录/改配置前启动的巡检已经过时
             online, uid = item[1], item[2]
+            self._update_dns_state(item[3] if len(item) > 3 else None)
             self._set_tray_status(online, uid)
             if online is True:
                 # 已经在线说明账号没问题，解除熔断
@@ -2467,15 +2973,24 @@ class CampusApp(tk.Tk):
                     log("检测到离线，自动重连（第 %d 次）" % (self.fail_streak + 1))
                     self._run_login_thread(
                         cfg, notify=(self.fail_streak == 0), auto=True)
+        elif kind == "dns_fixed":
+            self._update_dns_state("ok")
+            self._notify("DNS 已修复", item[1] + "；正在重新登录")
+            self.relogin_pending = True
+            self._drain_dns_relogin()
         elif kind == "action":
             self._handle_tray_action(item[1])
         elif kind == "toast":
             self._toast(item[1], item[2])
         elif kind == "done":
+            if len(item) > 4 and item[4] != self.status_epoch:
+                return              # 旧任务不能结束新任务的忙碌状态或重试策略
+            self.worker = None      # done 是当前任务的最后一条消息，可安全补登录
             self._set_busy(False)
             self._after_login(item[1],
                               item[2] if len(item) > 2 else None,
                               item[3] if len(item) > 3 else False)
+            self._drain_dns_relogin()
 
     def _set_busy(self, busy):
         state = "disabled" if busy else "normal"
@@ -2523,6 +3038,21 @@ def selftest_report():
     lines.append("本机地址: %s%s"
                  % (", ".join(ips) or "无",
                     "" if has_campus_ip() else "（不在校园网网段）"))
+    dns_host = _portal_host_of(portal)
+    if _ip_literal(dns_host):
+        lines.append("DNS: 门户为 IP 地址，不依赖 DNS")
+    else:
+        state = check_dns_health(portal)
+        cached = _dns_cache_get(dns_host)
+        if state == "broken":
+            lines.append("DNS 解析: 失败（在校园网内却解析不了，多半被改成了手动%s）"
+                         % ("；失败时将回退缓存 IP %s" % cached if cached
+                            else "；无缓存可用，托盘右键「修复 DNS」可恢复"))
+        elif state == "ok":
+            lines.append("DNS 解析: 正常%s"
+                         % ("；异常时会用缓存 IP %s 兜底" % cached if cached else ""))
+        else:
+            lines.append("DNS 解析: 未测（不在校园网内）")
     try:
         import cryptography        # noqa: F401  只检查能不能 import
         lines.append("加密库 cryptography: 可用")
