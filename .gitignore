@@ -3,6 +3,8 @@
 config.json
 login.log
 login.log*
+# DNS 故障回退用的域名-IP 缓存（运行期生成）
+dns_cache.json
 diag.txt
 diag_raw/
 *.log

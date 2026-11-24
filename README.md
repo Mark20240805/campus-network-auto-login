@@ -72,7 +72,8 @@ python 校园网自动登录.py --status
 
 1. 打包 + 签名的完整流程见 [docs/build.md](docs/build.md)，
    产物 `installer\output\校园网自动认证系统_安装包_1.1.0.exe`
-2. **不要附带 `config.json`**——里面是你的学号和你机器加密的密码
+2. **不要附带 `config.json`**——里面是你的学号和你机器加密的密码；
+   `dns_cache.json` 也别带，那是你机器的域名解析缓存
 3. 同学双击安装 → 填自己的学号密码 → 勾「开机自动登录」→ 保存并登录
 
 ## 常见问题
@@ -82,6 +83,9 @@ python 校园网自动登录.py --status
 - **托盘图标不显示**：未装 pystray，执行 `pip install pystray pillow`
 - **提示缺少 cryptography**：执行 `pip install cryptography`（密码加密必需）
 - **开机没自动登录**：托盘菜单确认已勾选；任务管理器 → 启动 中查看是否被禁用
+- **浏览器打不开认证页 / 托盘一直灰色**：多半是网卡 DNS 被其他软件改成手动；
+  1.1.0 起会自动用缓存 IP 兜底，右键「修复 DNS」可一键恢复，详见
+  [docs/troubleshooting.md](docs/troubleshooting.md#浏览器打不开认证页--工具一直灰色状态未知)
 - **登录失败**：打开 `login.log` 对照 [docs/troubleshooting.md](docs/troubleshooting.md) 的报错表
 
 更多排错手段（probe 调试脚本 / autodiag 自动诊断 / selftest）见
@@ -106,7 +110,7 @@ python 校园网自动登录.py --status
 | [docs/config-and-privacy.md](docs/config-and-privacy.md) | config.json 全字段说明、DPAPI 加密边界、日志脱敏与轮转 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 调试脚本、自动诊断、常见报错对照表、完整 FAQ |
 | [docs/build.md](docs/build.md) | 三种打包方案、Inno Setup 安装包、代码签名与 SmartScreen、杀毒误报 |
-| [docs/development.md](docs/development.md) | 测试（101 用例）、版本号同步清单、GitHub 推送与 Release 流程 |
+| [docs/development.md](docs/development.md) | 测试（158 用例）、版本号同步清单、GitHub 推送与 Release 流程 |
 
 ## 免责声明
 

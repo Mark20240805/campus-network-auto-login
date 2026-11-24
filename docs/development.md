@@ -13,8 +13,12 @@ python -m pytest -q
 ```
 
 ```
-101 passed in 1.0s
+158 passed
 ```
+
+目前共 158 项，分布在 `test_core.py`、`test_config_log.py`、`test_portal_parse_edge.py`、
+`test_portal_parse_ui.py`、`test_dns_fallback.py`、`test_reliability.py` 六个文件；
+各文件覆盖范围见 [tests/README.md](../tests/README.md)。
 
 - `tests/conftest.py` 注入了 tkinter 的测试替身，所以 **无图形环境也能跑**（GitHub Actions 的 Windows runner 用的就是这套）
 - 测试数据全部是虚构的学号 / MAC / IP，不含任何真实个人信息
@@ -53,14 +57,21 @@ git push origin v1.1.0          # 推标签（Release 要用）
 ```
 
 exe 和安装包**不进仓库**，作为 [Release](https://docs.github.com/repositories/releasing-projects-on-github)
-附件上传：在 GitHub 页面 `Releases → Draft a new release`，选 `v1.1.0` 标签，
-把 `installer\output\校园网自动认证系统_安装包_1.1.0.exe` 和
-`stage_nuitka\...\校园网自动认证系统.exe` 拖进附件区，正文直接复用 `CHANGELOG.md` 的 1.1.0 段落。
+附件上传：在 GitHub 页面 `Releases → Draft a new release`，选 `v1.1.0` 标签，附件只放两个文件：
 
-建议同时附上校验值，方便同学核对下载是否完整：
+- `installer\output\校园网自动认证系统_安装包_1.1.0.exe`
+- `installer\output\SHA256SUMS.txt`
+
+**不要上传 `stage_nuitka` 里的裸 exe**：standalone 主程序单独下载缺依赖跑不起来，
+历来只发布安装包。正文直接复用 `CHANGELOG.md` 的 1.1.0 段落。
+
+生成校验清单时注意：GitHub 会把中文附件名转写成英文名，清单里必须写转写后的名字，
+否则用户下载后 `sha256sum -c` 会因找不到文件而失败：
 
 ```bash
 certutil -hashfile "installer\output\校园网自动认证系统_安装包_1.1.0.exe" SHA256
+# 把输出的 64 位哈希写进 installer\output\SHA256SUMS.txt，格式为：
+# <哈希>  campus-network-auto-login_Setup_1.1.0.exe
 ```
 
 万一以后误提交了 `config.json`，执行 `git rm --cached config.json` 再提交，
