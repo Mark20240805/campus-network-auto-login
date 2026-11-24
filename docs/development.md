@@ -63,7 +63,8 @@ exe 和安装包**不进仓库**，作为 [Release](https://docs.github.com/repo
 - `installer\output\SHA256SUMS.txt`
 
 **不要上传 `stage_nuitka` 里的裸 exe**：standalone 主程序单独下载缺依赖跑不起来，
-历来只发布安装包。正文直接复用 `CHANGELOG.md` 的 1.1.0 段落。
+历来只发布安装包。Release 正文只写用户能感知的 3–5 条变化，详细清单链接到
+`CHANGELOG.md`，不要把变更记录整段贴上去。
 
 生成校验清单时注意：GitHub 会把中文附件名转写成英文名，清单里必须写转写后的名字，
 否则用户下载后 `sha256sum -c` 会因找不到文件而失败：
