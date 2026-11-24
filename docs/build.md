@@ -63,7 +63,7 @@ python -m nuitka --standalone --windows-console-mode=disable ^
   --include-package=pystray --include-package=PIL --include-package=cryptography ^
   --windows-icon-from-ico=tools\app.ico ^
   --company-name="CampusNet AutoLogin" --product-name="校园网自动认证系统" ^
-  --file-version=1.0.4.0 --product-version=1.0.4.0 ^
+  --file-version=1.1.0.0 --product-version=1.1.0.0 ^
   --output-dir=nuitka_out --output-filename=校园网自动认证系统.exe ^
   校园网自动登录.py
 ```
@@ -115,7 +115,7 @@ python -m nuitka --standalone --windows-console-mode=disable ^
   "/DMyPayloadDir=..\stage_nuitka\校园网自动认证系统" installer\campusnet.iss
 ```
 
-产物：`installer\output\校园网自动认证系统_安装包_1.0.4.exe`
+产物：`installer\output\校园网自动认证系统_安装包_1.1.0.exe`
 
 - 不传 `/DMyPayloadDir` 时默认用 `..\stage_nuitka\校园网自动认证系统`
 - `[Files]` 用的是通配，PyInstaller 的 `_internal` 结构和 Nuitka 的扁平结构都能打
@@ -180,7 +180,7 @@ Nuitka 编译 → 签 stage_nuitka\…\校园网自动认证系统.exe → ISCC 
 
 ```powershell
 Get-AuthenticodeSignature 'stage_nuitka\校园网自动认证系统\校园网自动认证系统.exe'
-Get-AuthenticodeSignature 'installer\output\校园网自动认证系统_安装包_1.0.4.exe'
+Get-AuthenticodeSignature 'installer\output\校园网自动认证系统_安装包_1.1.0.exe'
 ```
 
 ### 让同学的电脑也信任（自签名才需要）
@@ -252,7 +252,7 @@ powershell -ExecutionPolicy Bypass -File tools\sign.ps1 -Pfx D:\codesign.pfx -Pf
 同学拿到文件后可以这样绕开拦截（任选其一）：
 
 - 右键 exe → 属性 → 底部勾「**解除锁定**」→ 确定
-- 或用 PowerShell：`Unblock-File .\校园网自动认证系统_安装包_1.0.4.exe`
+- 或用 PowerShell：`Unblock-File .\校园网自动认证系统_安装包_1.1.0.exe`
 - SmartScreen 弹窗里点「更多信息」→「仍要运行」
 - 通过 U 盘/局域网拷贝（没有 Mark-of-the-Web）通常**根本不会弹**
 

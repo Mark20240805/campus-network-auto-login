@@ -17,7 +17,7 @@
 param(
     [string[]] $Files = @(
         "stage_nuitka\校园网自动认证系统\校园网自动认证系统.exe",
-        "installer\output\校园网自动认证系统_安装包_1.0.4.exe"
+        "installer\output\校园网自动认证系统_安装包_1.1.0.exe"
     ),
     [string] $Subject = "CN=CampusNet AutoLogin, O=Student Project, C=CN",
     [string] $Pfx,

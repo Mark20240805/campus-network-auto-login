@@ -71,7 +71,7 @@ python 校园网自动登录.py --status
 ## 分发给同学
 
 1. 打包 + 签名的完整流程见 [docs/build.md](docs/build.md)，
-   产物 `installer\output\校园网自动认证系统_安装包_1.0.4.exe`
+   产物 `installer\output\校园网自动认证系统_安装包_1.1.0.exe`
 2. **不要附带 `config.json`**——里面是你的学号和你机器加密的密码
 3. 同学双击安装 → 填自己的学号密码 → 勾「开机自动登录」→ 保存并登录
 
